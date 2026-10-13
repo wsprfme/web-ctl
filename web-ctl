@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+web-ctl — deploy & manage fullstack apps behind a Cloudflare Tunnel.
+
+One command registers an app end-to-end: nginx vhost (port 80, routed by
+hostname) + tunnel ingress entry + DNS CNAME + JSON registry, so the app
+becomes reachable at https://<name>.<domain> with zero manual DNS work.
+
+Designed for VMs with NO open inbound ports: all public traffic enters
+through the outbound-only cloudflared tunnel.
+
+Layout (defaults):
+  /opt/webapps/<name>/                app files
+  /opt/webapps/registry.json          app registry
+  /etc/nginx/sites-available/<name>   nginx vhost (symlinked to sites-enabled)
+  webapp-<name>.service               systemd unit
+  <name>.<domain>                     tunnel ingress + DNS CNAME
+
+Configuration (environment variables):
+  WEBCTL_DOMAIN      base domain                (default: inferred from config.yml)
+  WEBCTL_TUNNEL      tunnel name or ID          (default: `tunnel:` from config.yml)
+  WEBCTL_ROOT        apps root directory        (default: /opt/webapps)
+  WEBCTL_CF_CONFIG   cloudflared config path    (default: ~/.cloudflared/config.yml)
+
+Usage:
+  web-ctl add <name> <port> [--path DIR]                register app (nginx+ingress+DNS)
+  web-ctl register <name> <port> <service>              register app with an existing service
+  web-ctl unit <name> <exec...> [--user U] [--port N]   generate a systemd unit for the app
+  web-ctl list                                          status of all apps
+  web-ctl remove <name>                                 unregister (keeps files)
+  web-ctl logs <name> [-n 50]                           journalctl for the app service
+  web-ctl restart <name>                                systemctl restart the app service
+  web-ctl route <sub> <port>                            add a subdomain to the tunnel ingress
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+RESERVED_PORTS = {80}
+
+
+# ---------------------------------------------------------------- config
+
+def cf_config_path():
+    return os.environ.get("WEBCTL_CF_CONFIG",
+                          os.path.expanduser("~/.cloudflared/config.yml"))
+
+
+def apps_root():
+    return os.environ.get("WEBCTL_ROOT", "/opt/webapps")
+
+
+def registry_path():
+    return os.path.join(apps_root(), "registry.json")
+
+
+def read_cf_config():
+    path = cf_config_path()
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        die(f"cloudflared config not found at {path} "
+            f"(set WEBCTL_CF_CONFIG or create the tunnel first)")
+
+
+def infer_domain():
+    """Guess the base domain from the first ingress hostname in config.yml."""
+    m = re.search(r"^\s*-\s*hostname:\s*([A-Za-z0-9.-]+)", read_cf_config(), re.M)
+    if not m:
+        die(f"cannot infer domain from {cf_config_path()} (no ingress hostnames) — "
+            f"set WEBCTL_DOMAIN")
+    labels = m.group(1).split(".")
+    if len(labels) < 2:
+        die(f"cannot infer domain from hostname '{m.group(1)}' — set WEBCTL_DOMAIN")
+    return ".".join(labels[1:])
+
+
+def get_domain():
+    return os.environ.get("WEBCTL_DOMAIN") or infer_domain()
+
+
+def get_tunnel():
+    """Tunnel name/ID: env override, else the `tunnel:` key in config.yml."""
+    env = os.environ.get("WEBCTL_TUNNEL")
+    if env:
+        return env
+    m = re.search(r"^tunnel:\s*(\S+)", read_cf_config(), re.M)
+    if not m:
+        die(f"cannot infer tunnel from {cf_config_path()} (no `tunnel:` key) — "
+            f"set WEBCTL_TUNNEL")
+    return m.group(1)
+
+
+# ---------------------------------------------------------------- helpers
+
+def run(cmd, check=False):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"command failed: {cmd}\n{r.stderr}")
+    return r.stdout.strip(), r.returncode
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def sudo_tee(path, content):
+    """Write a root-owned file via `sudo -n tee`."""
+    p = subprocess.run(["sudo", "-n", "tee", path],
+                       input=content, capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"cannot write {path} (needs passwordless sudo): {p.stderr}")
+
+
+def load_reg():
+    if os.path.exists(registry_path()):
+        with open(registry_path()) as f:
+            return json.load(f)
+    return {"apps": {}}
+
+
+def save_reg(reg):
+    os.makedirs(os.path.dirname(registry_path()), exist_ok=True)
+    with open(registry_path(), "w") as f:
+        json.dump(reg, f, indent=2)
+
+
+def app_running(svc):
+    _, rc = run(f"systemctl is-active {svc}")
+    return rc == 0
+
+
+# ---------------------------------------------------------------- cloudflare
+
+def add_cf_ingress(sub, port=80):
+    """Insert the hostname before the catch-all ingress rule.
+
+    Returns False if the hostname is already routed.
+    """
+    host = f"{sub}.{get_domain()}"
+    cfg = read_cf_config()
+    if host in cfg:
+        return False  # already routed
+    entry = f"  - hostname: {host}\n    service: http://localhost:{port}\n"
+    catchall = "- service: http_status:404"
+    if catchall not in cfg:
+        die(f"catch-all rule (`{catchall}`) not found in {cf_config_path()}")
+    cfg = cfg.replace(catchall, entry + catchall, 1)
+    with open(cf_config_path(), "w") as f:
+        f.write(cfg)
+    return True
+
+
+def route_dns(sub):
+    host = f"{sub}.{get_domain()}"
+    out, rc = run(f"cloudflared tunnel route dns {get_tunnel()} {host}")
+    if rc != 0:
+        print(f"warn: DNS route for {host} failed: {out}", file=sys.stderr)
+
+
+def cf_restart():
+    out, rc = run("sudo -n systemctl restart cloudflared && systemctl is-active cloudflared")
+    if rc != 0:
+        die(f"cloudflared restart failed:\n{out}")
+
+
+# ---------------------------------------------------------------- nginx
+
+def nginx_conf(name, port, sub):
+    host = f"{sub}.{get_domain()}"
+    return f"""server {{
+    listen 80;
+    listen [::]:80;
+    server_name {host};
+
+    location / {{
+        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300;
+    }}
+}}
+"""
+
+
+def add_nginx_site(name, port, sub):
+    avail = f"/etc/nginx/sites-available/{name}"
+    sudo_tee(avail, nginx_conf(name, port, sub))
+    run(f"sudo -n ln -sf {avail} /etc/nginx/sites-enabled/{name}")
+
+
+def nginx_reload():
+    out, rc = run("sudo -n nginx -t 2>&1 && sudo -n systemctl reload nginx")
+    if rc != 0:
+        die(f"nginx reload failed:\n{out}")
+
+
+# ---------------------------------------------------------------- systemd
+
+def generate_unit(name, exec_start, user=None, port=None):
+    user = user or run("id -un")[0]
+    workdir = os.path.join(apps_root(), name)
+    lines = [
+        "[Unit]",
+        f"Description={name} web app",
+        "After=network.target",
+        "",
+        "[Service]",
+        f"User={user}",
+        f"WorkingDirectory={workdir}",
+        f"ExecStart={exec_start}",
+        "Restart=always",
+        "RestartSec=3",
+    ]
+    if port is not None:
+        lines.append(f"Environment=PORT={port}")
+    lines += ["", "[Install]", "WantedBy=multi-user.target", ""]
+    return "\n".join(lines)
+
+
+def cmd_unit(name, exec_args, user=None, port=None):
+    if not exec_args:
+        die("usage: web-ctl unit <name> <exec...> [--user U] [--port N]")
+    unit_path = f"/etc/systemd/system/webapp-{name}.service"
+    sudo_tee(unit_path, generate_unit(name, " ".join(exec_args), user, port))
+    run("sudo -n systemctl daemon-reload")
+    print(f"OK wrote {unit_path}")
+    print(f"start it after deploying files: sudo systemctl enable --now webapp-{name}")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_add(name, port, service=None, path=None):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+        die("name: alphanumeric + -_ only, must start alphanumeric")
+    reg = load_reg()
+    if name in reg["apps"]:
+        die(f"app '{name}' already registered (use remove first)")
+    if service is None:
+        service = f"webapp-{name}"
+    sub = name.lower()
+    ports = [a["port"] for a in reg["apps"].values()]
+    if port in ports:
+        die(f"port {port} already used by: " + ", ".join(
+            n for n, a in reg["apps"].items() if a["port"] == port))
+    if port in RESERVED_PORTS:
+        die(f"port {port} is reserved")
+
+    app_dir = path or os.path.join(apps_root(), name)
+    os.makedirs(app_dir, exist_ok=True)
+
+    # 1. nginx site
+    add_nginx_site(name, port, sub)
+    nginx_reload()
+
+    # 2. cloudflare ingress + DNS
+    if add_cf_ingress(sub, port):
+        cf_restart()
+    route_dns(sub)
+
+    # 3. registry
+    reg["apps"][name] = {
+        "port": port, "service": service, "subdomain": sub,
+        "url": f"https://{sub}.{get_domain()}", "path": app_dir,
+        "added_at": run("date -Iseconds")[0],
+    }
+    save_reg(reg)
+    print(f"OK {name} -> https://{sub}.{get_domain()} (127.0.0.1:{port}, svc={service})")
+
+
+def cmd_list():
+    reg = load_reg()
+    if not reg["apps"]:
+        print("no apps registered")
+        return
+    print(f"{'NAME':<14}{'PORT':<7}{'SERVICE':<18}{'STATE':<10}URL")
+    for n, a in sorted(reg["apps"].items()):
+        st = "running" if app_running(a["service"]) else "stopped"
+        print(f"{n:<14}{a['port']:<7}{a['service']:<18}{st:<10}{a['url']}")
+
+
+def cmd_remove(name):
+    reg = load_reg()
+    if name not in reg["apps"]:
+        die(f"'{name}' not registered")
+    a = reg["apps"][name]
+    run(f"sudo -n rm -f /etc/nginx/sites-enabled/{name} "
+        f"/etc/nginx/sites-available/{name}")
+    nginx_reload()
+    run(f"sudo -n systemctl stop {a['service']} 2>/dev/null; true")
+    del reg["apps"][name]
+    save_reg(reg)
+    print(f"OK removed '{name}' (files kept at {a['path']})")
+
+
+def cmd_logs(name, n=50):
+    reg = load_reg()
+    if name not in reg["apps"]:
+        die(f"'{name}' not registered")
+    out, _ = run(f"journalctl -u {reg['apps'][name]['service']} -n {n} "
+                 f"--no-pager -o cat")
+    print(out or "(no logs)")
+
+
+def cmd_restart(name):
+    reg = load_reg()
+    if name not in reg["apps"]:
+        die(f"'{name}' not registered")
+    out, rc = run(f"sudo -n systemctl restart {reg['apps'][name]['service']}")
+    print("OK restarted" if rc == 0 else f"ERROR: {out}")
+
+
+def cmd_route(sub, port):
+    if add_cf_ingress(sub, port):
+        cf_restart()
+        route_dns(sub)
+        print(f"OK https://{sub}.{get_domain()} -> 127.0.0.1:{port} "
+              f"(update nginx manually)")
+    else:
+        print(f"{sub}.{get_domain()} already in ingress")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return
+    c, rest = a[0], a[1:]
+
+    if c == "add" and len(rest) >= 2:
+        path = None
+        if "--path" in rest:
+            i = rest.index("--path")
+            path = rest[i + 1]
+            del rest[i:i + 2]
+        cmd_add(rest[0], int(rest[1]), path=path)
+    elif c == "register" and len(rest) >= 3:
+        cmd_add(rest[0], int(rest[1]), service=rest[2])
+    elif c == "unit" and len(rest) >= 1:
+        user, port = None, None
+        args = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--user":
+                user = rest[i + 1]; i += 2
+            elif rest[i] == "--port":
+                port = int(rest[i + 1]); i += 2
+            else:
+                args.append(rest[i]); i += 1
+        cmd_unit(args[0], args[1:], user=user, port=port)
+    elif c == "list":
+        cmd_list()
+    elif c == "remove" and rest:
+        cmd_remove(rest[0])
+    elif c == "logs" and rest:
+        cmd_logs(rest[0], int(rest[2]) if len(rest) > 2 and rest[1] == "-n" else 50)
+    elif c == "restart" and rest:
+        cmd_restart(rest[0])
+    elif c == "route" and len(rest) >= 2:
+        cmd_route(rest[0], int(rest[1]))
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
